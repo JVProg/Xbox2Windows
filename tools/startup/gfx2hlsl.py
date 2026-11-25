@@ -5066,6 +5066,15 @@ class Pipeline:
         key = ('cmp',) + tuple(key) if comparison else ('lod',) + tuple(key) if lod_limits else key
         return 'q%d' % self.samplers.setdefault(key, len(self.samplers))
 
+    def sampler_lines(self):
+        """The manifest lines of the static samplers, graphics and compute: smp, smpc or smpl by the key's prefix."""
+        lines = []
+        for key, i in self.samplers.items():
+            prefixed = key[0] in ('cmp', 'lod')
+            lines.append('%s %d %s' % ({'cmp': 'smpc', 'lod': 'smpl'}.get(key[0], 'smp'), i,
+                                       ' '.join('0x%x' % w for w in key[prefixed:])))
+        return lines
+
     def common(self):
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
@@ -5292,10 +5301,7 @@ class Pipeline:
             if source[0] != 'table':
                 raise Unsupported('stored image through %s' % (source,))
             lines.append('uav %d %s table %d %d' % (r['index'], r['kind'], source[1] if len(source) > 1 else 0, off or 0))
-        for key, i in self.samplers.items():
-            prefixed = key[0] in ('cmp', 'lod')
-            lines.append('%s %d %s' % ({'cmp': 'smpc', 'lod': 'smpl'}.get(key[0], 'smp'), i,
-                                       ' '.join('0x%x' % w for w in key[prefixed:])))
+        lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
@@ -5380,9 +5386,7 @@ class ComputePipeline(Pipeline):
                 lines.append('uav %d %s' % (r['index'], where))
             else:
                 lines.append('uav %d tex2d float %s channels 4' % (r['index'], where))
-        for key, i in self.samplers.items():
-            comparison = key[0] == 'cmp'
-            lines.append('%s %d %s' % ('smpc' if comparison else 'smp', i, ' '.join('0x%x' % w for w in key[comparison:])))
+        lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         return '\n'.join(lines) + '\n'
