@@ -1371,6 +1371,34 @@ foreach(backend IN ITEMS warp hardware)
 endforeach()
 
 
+# X2W_D3D12_VIEW_CENSUS=1 counts new distinct view records by slot and logs capacity and buckets before they grow.
+# `off` runs without the switch (nothing reported); `vary` is the negative control: the repeated stream is made distinct,
+# and the fixture must say so.
+add_executable(startup_view_census tests/startup_view_census.cpp)
+target_compile_features(startup_view_census PRIVATE cxx_std_17)
+target_link_libraries(startup_view_census PRIVATE d3d12_xs_shim d3d12 dxgi psapi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS on off vary)
+        set(census_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+        list(APPEND census_env "X2W_TRAP_LOG=${CMAKE_CURRENT_BINARY_DIR}/startup_view_census_${mode}_${backend}.log")
+        if(NOT mode STREQUAL "off")
+            list(APPEND census_env "X2W_D3D12_VIEW_CENSUS=1")
+        endif()
+        if(mode STREQUAL "on")
+            set(census_test startup_view_census_${backend})
+            add_test(NAME ${census_test} COMMAND startup_view_census ${backend})
+        else()
+            set(census_test startup_view_census_${mode}_${backend})
+            add_test(NAME ${census_test} COMMAND startup_view_census ${backend} ${mode})
+        endif()
+        set_tests_properties(${census_test} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 ENVIRONMENT "${census_env}")
+        if(mode STREQUAL "vary")
+            set_tests_properties(${census_test} PROPERTIES
+                PASS_REGULAR_EXPRESSION "FAIL: the repeated stream added records")
+        endif()
+    endforeach()
+endforeach()
+
 add_executable(startup_resource_retire_title tests/startup_resource_retire_title.cpp)
 target_include_directories(startup_resource_retire_title PRIVATE src)
 target_compile_features(startup_resource_retire_title PRIVATE cxx_std_17)
