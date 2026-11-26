@@ -158,7 +158,10 @@ int main(int argc, char** argv)
                           reinterpret_cast<void**>(t.GetAddressOf()))))
             return 3;
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    // The stand-in identifies a view by every byte of its description, padding included, so each description is zeroed
+    // with memset before its fields are set: brace initialization need not clear the padding.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    std::memset(&srv, 0, sizeof(srv));
     srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -167,7 +170,10 @@ int main(int argc, char** argv)
         invoke<void>(guest.Get(), 18, static_cast<void*>(textures[index].Get()), &srv, handle);
     };
     const auto constant_view = [&](UINT index, UINT64 handle) {
-        const D3D12_CONSTANT_BUFFER_VIEW_DESC desc{0x100000ull + 256ull * index, 256};
+        D3D12_CONSTANT_BUFFER_VIEW_DESC desc;
+        std::memset(&desc, 0, sizeof(desc));
+        desc.BufferLocation = 0x100000ull + 256ull * index;
+        desc.SizeInBytes = 256;
         invoke<void>(guest.Get(), 17, &desc, handle);
     };
 
@@ -257,7 +263,8 @@ int main(int argc, char** argv)
                           static_cast<const D3D12_CLEAR_VALUE*>(nullptr), &iid,
                           reinterpret_cast<void**>(b.GetAddressOf()))))
             return 3;
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav;
+    std::memset(&uav, 0, sizeof(uav));
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uav.Buffer.NumElements = 16;
     uav.Buffer.StructureByteStride = 16;
