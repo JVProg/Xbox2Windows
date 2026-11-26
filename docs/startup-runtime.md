@@ -208,7 +208,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-Graphics and compute use cache revisions `x2w-startup-shader-27` and `x2w-startup-shader-27cs`.
+Graphics and compute use cache revisions `x2w-startup-shader-28` and `x2w-startup-shader-28cs`.
+Revision 28 lowers `v_fma_mix*` through a `precise` `mad`, so a zero product keeps its sign.
 Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
 Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
 treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
@@ -556,8 +557,9 @@ Three census lines follow the five-second report whenever their counts changed
 - `x2w-d3d12 memory SRV refusals (slot 70): total N; <reason> n, ...; distinct shapes K` counts every
   refused slot 70 call by reason. It then prints one `x2w-d3d12 memory SRV refused shape i:` line per
   distinct `reason`, dimension, format, size, mips, layout and flags, for the reasons that depend on the
-  description (all but `null_destination`, `unreadable_resource`, `unreadable_view`, `null_address` and
-  `destination_outside_view_heaps`). The reasons include the partial-tile holds (`partial_tile_*`) and the
+  description (all but `null_destination`, `unreadable_resource`, `unreadable_view`, `null_address`,
+  `destination_outside_view_heaps` and the acceleration-structure holds `as_unaligned`, `as_not_placed` and
+  `as_wrong_state`). The reasons include the partial-tile holds (`partial_tile_*`) and the
   console-layout holds (`unsupported_desktop_format`, `console_layout_*`, `overlapping_resource`).
   Up to 128 shapes are kept; later shapes are only counted. The periodic report lists the shapes counted
   since it last ran.
@@ -1484,14 +1486,14 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_PRESENT_COMPOSITE=1` | experimental, in render mode: the output window composites every presented plane, bottom to top, instead of showing plane 0 alone, and the highest plane above plane 0 is sampled as `x2w-render raw plane <i> (not composited)`. Off by default; the baseline capture and `x2w-render presented` read plane 0 either way. See [Presented planes](#presented-planes) |
 | `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
-| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
+| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR`, `X2W_DRAW_DUMP_PIXEL=<x>,<y>` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). With `X2W_DRAW_DUMP_PIXEL`, each copy covers one texel instead and the present writes `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: one line per translated draw with `draw=`, `frame=`, `x=`, `y=`, `key=`, `count=`, `format=`, `raw=` and, for an 8-bit four-channel target, `rgba=`. The bounded history names the last draw that changed the texel (`src/startup_stubs/pixel_history.h`, `ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V`). |
 | `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
 | `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
-| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
+| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
@@ -1545,6 +1547,14 @@ profiles do not, and that module met desktop refusals the other profiles did not
 access, the last covered by the
 [shared-exponent stand-in](#shared-exponent-render-and-unordered-access-targets)). Choosing a profile
 is not evidence that the path it leads to runs.
+
+A title on the Series S profile may present its picture on a plane above plane 0 and leave plane 0
+black (see [Presented planes](#presented-planes) for a measured case). The output window shows plane 0 alone by
+default, so it then stays black. `X2W_PRESENT_COMPOSITE=1` composites the planes, and
+`X2W_PRESENT_PLANE=<n>` shows one plane alone. Whether other titles, or other profiles, present
+this way is not known. Under either switch, `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented`
+readback still read plane 0. With `X2W_PRESENT_COMPOSITE=1`, the `x2w-render raw plane <n>` line
+shows whether the higher plane holds a picture.
 
 ## D3D12 resource budget
 
@@ -2014,6 +2024,11 @@ exists succeeds. Names must be one plain path component of at most 128 bytes (no
 case) and a blob is at most 64 MiB. The storage root itself is trusted; a container directory or blob
 that is a symbolic link or, on Windows, a junction is refused by every operation.
 
+`X2W_STORAGE_PATH` is the root of the console drive, not the save folder. The title appends
+`x2w-gamesave` to it, so `S:\` stores the files under `S:\x2w-gamesave` while
+`S:\x2w-gamesave` stores them under `S:\x2w-gamesave\x2w-gamesave`. Point it at the drive root
+(or a folder mounted as a drive) and keep one path per profile set.
+
 Blob writes and deletes are kept with the update and reach the disk only when the update is
 submitted (the public API makes the whole update atomic at submit). An update closed without a
 submit changes nothing. At submit every write goes to a staging file and every delete is checked
@@ -2200,6 +2215,18 @@ These are measured on one executable; treat them as hypotheses for others.
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
   pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
   compare bit, the carry or read `vcc_hi` as zero as failing controls.
+- **Wave reductions.** A whole wave32 reduction chain in a straight-line pixel stage (`s_or_saveexec_b32 sS, -1`,
+  the identity fill `v_cndmask_b32_e64 vT, <identity>, vX, sS`, four `_dpp` steps `quad_perm:[1,0,3,2]`,
+  `quad_perm:[2,3,0,1]`, `row_half_mirror`, `row_mirror`, `v_permlanex16_b32 vP, vT, 0, 0`, the combine,
+  `s_mov_b32 exec_lo, sS` and `v_readlane_b32 sD, vT, 31`) of `v_or_b32`, `v_min_u32` or `v_max_u32` is recognised
+  as one `WaveActiveBitOr`, `WaveActiveMin` or `WaveActiveMax` over the active lanes of the desktop wave (a correct
+  program cannot depend on how pixels are packed into waves). The min chain may read its lane later, as the #2125
+  censuses show: after its restore, one `v_cndmask_b32_sdwa` (lowered as usual), the saveexec of a max chain, then the
+  readlane, carried by that max chain before its fill. The entry EXEC must still hold, without `s_wqm`, so helper
+  lanes are left out on both sides. Other shapes that start like a chain are refused with their reason
+  ([the note](experiments/startup-gfx2hlsl-wave-reduce.md)). Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_wave_reduce"`.
+  [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -2948,7 +2975,8 @@ process's peak and current commit charge in MiB and the number of live 64 KiB ph
 (the heartbeat still calls them sections), so runs that stop at different points can be compared by
 memory spent rather than by elapsed time. A physical page holds a slot from its first use (a mapping
 or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
-experimental `x2w_xmem_page_stats` export.
+experimental `x2w_xmem_page_stats` export. A page-token write (`x2w_xmem_write_physical`) to a page
+that has no grant is refused with `ERROR_INVALID_PARAMETER`, like a mapping of it.
 
 The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
 its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
@@ -3323,8 +3351,14 @@ recording and before submit, while the cap skips multi-GiB existing heaps to avo
 uncovered prefix, and right before
 `OpenExistingHeapFromAddress` opens the heap). Anything else gets a
 committed default buffer that does not alias the title memory, holds zeros and is reported as
-success (`not aliased` in the log). `reserve_upload_ring` similarly grows in demand chunks starting at 16 MiB up to the
-256 MiB total cap instead of committing 256 MiB upfront. `X2W_D3D12_LINEAR_BUFFERS` changes this for one buffer kind: a
+success (`not aliased` in the log). `reserve_upload_ring` grows in demand
+chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
+bytes for the process; the allocator may use an older unused tail but
+refuses exhaustion or allocation failure rather than resetting live storage.
+`upload_reservation` exercises the shared cursor and returned-pointer contract
+without D3D12; on non-Windows hosts run
+`c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.
+`X2W_D3D12_LINEAR_BUFFERS` changes placement for one buffer kind: a
 buffer description with row-major or unknown layout and initial state `COMMON`
 (`src/startup_stubs/linear_buffer_backing.h`, [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914)).
 Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, keep the default backing.

@@ -83,6 +83,25 @@ cmake --build --preset dev --target startup_present_producer
 ctest --preset dev --no-tests=error -R '^startup_present_producer_(warp|hardware)$' -V
 ```
 
+## Per-draw texel history
+
+`X2W_DRAW_DUMP_FRAME=<n>` with `X2W_DRAW_DUMP_PIXEL=<x>,<y>` keeps one texel of render target 0 after
+each translated draw of that frame instead of copying the whole target. The completed reads are
+written to `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: `draw=` is the copy ordinal, `frame=` is the
+frame that recorded it, `x=` and `y=` name the texel, `key=` is the translated manifest key, and
+`rgba=` is decoded for R8G8B8A8/B8G8R8A8 UNORM or sRGB.
+The same 48-copy bound as the full dump applies. A reader can follow the value after every draw and
+name the one that last changed the texel.
+
+`startup_pixel_history` builds three draws on a 4x4 target. The first and third are scissored to the
+top-left texel; only the second covers the watched texel (1, 1). The report must name draw 2 with its
+manifest key, and the control that omits draw 2 must leave the texel black at draw 3.
+
+```powershell
+cmake --build --preset dev --target startup_pixel_history
+ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V
+```
+
 ### Translated indirect triangles
 
 `X2W_TRANSLATED_INDIRECT_DRAW=1` lets a slot 57 cached translation record one non-indexed
@@ -7004,7 +7023,7 @@ The `SUB_CO` fixture in `tests/compute_store_check.py` (`draw-sub-co`, `compute_
 
 `v_mac_f32_e32 vD, S0, vS1` (VOP2 `0x1f`) and `v_mac_f32_e64 vD, S0, S1` (VOP3) compute `D = S0 * S1 + D` as an unfused binary32 multiply-add: the intermediate product `S0 * S1` rounds to binary32 before the addition. `D` is both an input accumulator and the destination. Lowering uses `f32_mac(a, b, c)` with separate `precise float p = asfloat(a) * asfloat(b)` and `precise float r = p + asfloat(c)` so DXC does not contract the operation to FMA. NaN/Inf/denormal literal constants, uninitialized/unknown or pending `S0`/`S1`/`D`, `vD > 255`, source modifiers (`-`, `|.|`), `clamp`, `omod`, and bare `v_mac_f32` are refused.
 
-The `MAC_F32` fixture in `tests/compute_store_check.py` (`draw-mac-f32`, `compute_store_aot_mac_f32_${adapter}`) runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), including `4097 * 4097 + (-16785408)` and `(1 + 2^-23) * (1 + 2^-23) - (1 + 2^-22)` where unfused and fused results differ, and compares all 320 words against an independent Python model. Reference controls (fused FMA at word 0, `p - c` at word 2, accumulator zeroed at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (`mad()` fused multiply-add, `p - asfloat(c)`) must all fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mac_f32_(warp|hardware)$' -V`.
+The `MAC_F32` fixture in `tests/compute_store_check.py` (`draw-mac-f32`, `compute_store_aot_mac_f32_${adapter}`) runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), including `4097 * 4097 + (-16785408)` and `(1 + 2^-23) * (1 + 2^-23) - (1 + 2^-22)` where unfused and fused results differ, and compares all 320 words against an independent Python model. Reference controls (fused FMA at word 0, `p - c` at word 2, accumulator zeroed at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (`mad()` fused multiply-add, `p - asfloat(c)`) must all fail. DXIL lets the driver fuse `mad()` (`FMad`) or not, so on hardware the `mad()` mutation is first read back against the fused and the unfused model. Exactly one must match all 320 words; anything else fails the test. Where the unfused model matches (an RX 5700 XT and an RX 9070 XT, [#2730](https://github.com/R0Y00/Xbox2Windows/issues/2730)), the mutation equals the lowering, and the test logs it as inapplicable on that adapter. The full comparison, the reference controls and the other mutations stay mandatory. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mac_f32_(warp|hardware)$' -V`.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_i32_(warp|hardware)$' -V
@@ -9699,7 +9718,30 @@ an earlier fixture that did so, the split left the result at its sentinel.
 The scratch is kept with the recording's desktop allocator
 (`x2w_d3d12_recording_scratches` reports how many it holds) and is released
 only when that allocator is reset after every queue that ran it has passed its
-fence.
+fence. The rewrite's root signature and pipeline are kept for the life of the
+process in an instance that is never destroyed. In #2683 the instance was a
+function-local static: on an RX 9070 XT (driver 32.0.32029.2010) its destructor
+released the pipeline during DLL detach and the process exited with 0xC0000409
+in `amdxc64.dll` after every readback had passed. A never-destroyed instance
+exited 0 in 3 of 3 runs there.
+[Review](https://github.com/R0Y00/Xbox2Windows/pull/2683)
+On the same adapter and driver, with this change merged onto main,
+`startup_indirect_count_split_hardware` passed and 6 of 6 direct runs exited 0;
+with only `split_indirect_dispatch.h` restored to the static, 4 of 4 runs ended
+in 0xC0000409, the dump showing the static's destructor in
+`_execute_onexit_table` at DLL detach.
+[Measurement](https://github.com/R0Y00/Xbox2Windows/pull/2734)
+
+The cache is process-owned and released only by process exit. Explicitly
+unloading and reloading `d3d12_xs.dll` in a live host is not a supported path:
+each load allocates a new cache and nothing tears the previous one down outside
+the loader lock. Supporting it needs that teardown and its own coverage. The
+kept root signature and pipeline each hold a reference to their device: on the
+RX 5700 XT and WARP 10.0.26100.9818 the device count went from 1 to 3 with both
+objects created, and stayed at 2 after the application released its own
+reference. So a cached device is never destroyed, and `entry_for`, which matches
+devices by pointer, cannot see a new device at a reused address while an entry
+holds those objects. An entry whose build failed holds neither.
 
 `startup_indirect_count_(warp|hardware)` keep the native call. On the RX 5700
 XT (driver 32.0.21045.29003) the hardware test still fails at its first case
@@ -10137,7 +10179,32 @@ the empty `targets` line, a control without the EXEC narrowing (no discard)
 and a null export followed by a position export (still refused). A slot 57
 pixel stage that has the null export next to an `mrt0`, `mrtz` or `param0`
 export, in either order, is refused before any source or manifest is written;
-the general pixel path keeps those mixed forms. The
+the general pixel path keeps those mixed forms.
+
+One mixed form is accepted: the early exit of a kill. LLVM
+`SILateBranchLowering` and Mesa ACO place it after the program's `s_endpgm`:
+`exp null off, off, off, off done vm` then the final `s_endpgm`, and every
+branch into the block enters with EXEC zero, so the export writes nothing
+(`kill_exit_block` in `gfx2hlsl.py`). An entry is `s_cbranch_execz`, or the
+demote form: `s_cbranch_scc0` directly after `s_cselect_b32 exec_lo, exec_lo, 0`
+or `s_cselect_b64 exec, exec, 0`. `s_cselect` leaves SCC, so the taken branch
+follows the select of 0; no branch may land on the `s_cbranch_scc0` itself. The
+rest of the stage, here an `mrt0` export after the kill, is translated as usual
+and keeps its `vm` discard. `startup_mesh57_depth_only_check.py` checks both
+forms and refuses ten near misses with the mixed-export message: the colour
+export falling through into the null export, a block no branch reaches, a block
+entered by `s_branch`, an exit export without `vm`, another instruction in the
+block, and for the demote form `s_cbranch_scc0` without the `s_cselect`, an
+`s_cselect` that keeps EXEC, one into another register, an instruction between
+the two, and `s_cbranch_scc1`. The
+`startup_mesh57_skeleton_kill_exit_{warp,hardware}` CTest checks draw both
+colour pairs with `offscreen_check --mesh-indexed`; lanes whose flat attribute 0
+red is at or below 0.5 are killed, so two of the four triangles are dropped.
+Each draw must match the CPU rasteriser without them, and the same mesh with the
+pixel stage that does not kill must differ at exactly the 115 killed pixels.
+Nothing here shows that a runtime path loads the pair.
+
+The
 `startup_mesh57_skeleton_depth_{warp,hardware}` CTest checks draw a
 source-built depth-only pair (`v_interp_mov_f32`, `v_cmpx_lt_f32 0.5, v0`,
 `exp null off, off, off, off done vm`, `s_endpgm`) twice with
@@ -10450,7 +10517,7 @@ Title memory follows XMem (`src/xmem_mapped_pages.cpp`). The section pool is one
 | Path | Backing |
 |---|---|
 | `share` | The pool is opened once as a heap: `OpenExistingHeapFromAddress` on a whole-pool view of the section, or on the allocation base for the private range (`OpenExistingHeapFromFileMapping` leaks Windows commit, #2234), after `D3D12_FEATURE_EXISTING_HEAPS`. A cross-adapter buffer is placed at the slot offset. Nothing is copied. |
-| `copy` | A default buffer fed from a two-slot upload ring. The ring wraps like `reserve_upload_ring`, but refuses a slot whose fence has not completed (`DXGI_ERROR_WAS_STILL_DRAWING`). Title memory is copied into the ring at one named copy point: `bind` (as `upload_from_title`), `record` (as `frame_copy`) or `submit`, just before `ExecuteCommandLists`. The ring slot is copied into the buffer at the start of the submission. When a use declares GPU writes, the buffer is copied to readback at the end, and completion of that fence copies readback to title memory. |
+| `copy` | A default buffer fed from a two-slot upload ring. The modeled ring wraps only after a slot's fence completes; otherwise it refuses (`DXGI_ERROR_WAS_STILL_DRAWING`). Title memory is copied into the ring at one named copy point: `bind` (as `upload_from_title`), `record` (as `frame_copy`) or `submit`, just before `ExecuteCommandLists`. The ring slot is copied into the buffer at the start of the submission. When a use declares GPU writes, the buffer is copied to readback at the end, and completion of that fence copies readback to title memory. |
 | `fallback` | Sharing is forced to fail: the section through a `FILE_MAP_READ` handle, or an interior address of the private range. The fixture records the HRESULT. The path falls back to `copy` only when the copy can keep the guarantees. A GPU-written use with no completion point is refused with the sharing HRESULT. |
 | `slot133` | A model of slot 133's fallback. A non-`MEM_PRIVATE` address is refused before D3D12 with `E_INVALIDARG`, and a committed default buffer stands in with `S_OK` and no copy. A private range is aliased through its allocation base. |
 
@@ -14875,10 +14942,15 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cselect_mask_controls$
 
 `tools/startup/gfx2hlsl.py` records the SGPRs that hold a lane mask (a `v_cmp` destination, a saveexec copy) in `Stage.masks`, and lowers a scalar logic op with a mask source as a mask op whose result is the lane's bit. The generic scalar path cleared the mark when it wrote ordinary data into such a register, but the other scalar writers did not. After `v_cmp_eq_u32_e64 s6, v0, v1` and `s_buffer_load_dword s6, s[16:19], 0x0`, s6 holds a buffer word, yet `s_or_b32 s8, s6, s7` was lowered as `s8 = (s6 | s7) & 1;`. Every write through `set_s` now clears the mark, the writers of a mask mark the register again after the write, and `s_load` clears the mark on its destination registers, also in the forms that only record a descriptor symbol.
 
-`tests/startup_gfx2hlsl_mask_overwrite_check.py` writes a mask with a compare, overwrites it with an `s_buffer_load`, an `s_load` through a root pointer, an `s_load` of a descriptor or an `s_cselect_b32`, and evaluates the following `s_or_b32` on a buffer word with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py`. Controls: without the overwrite the OR stays a mask OR, and a compare or a mask logic op after a load marks the register again. On the translator before this change seven checks fail (the mark stays and the OR is cut to bit 0). Test: `startup_gfx2hlsl_mask_overwrite_controls`. Not covered: a draw through a translated pipeline; the other symbol-only scalar writes (for example an `s_mov` of a descriptor) still keep a mark they find.
+`tests/startup_gfx2hlsl_mask_overwrite_check.py` writes a mask with a compare, overwrites it with an `s_buffer_load`, an `s_load` through a root pointer, an `s_load` of a descriptor or an `s_cselect_b32`, and evaluates the following `s_or_b32` on a buffer word with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py`. Controls: without the overwrite the OR stays a mask OR, and a compare or a mask logic op after a load marks the register again. On the translator before this change seven checks fail (the mark stays and the OR is cut to bit 0). Test: `startup_gfx2hlsl_mask_overwrite_controls`. Not covered: a draw through a translated pipeline.
+
+Scalar ALU on descriptor data (an `s_mov` of a descriptor word, a field extract or mask of one, an `s_add_u32` to a descriptor pointer) records only a symbol for its destination and did not clear the mark. A register that had held a mask and then a descriptor field kept the mark, so in a captured pixel program the stride clamp of a structured-to-raw conversion (`s_bfe_u32 s23, s45, 0xe0010`, then `s_max_u32 s23, s23, 1`) read as a lane-mask read. The descriptor-data path now clears the mark on its destination SGPRs before it writes them. The sources are classified before that, so a mask read by the same instruction is treated as before. The check runs these four writes after a compare in a pixel and a vertex stage and the clamp after the extract; a descriptor write into another SGPR keeps the mark on s6 (control). On the translator before this change (700522ef) six checks fail: the `s_bfe_u32` and `s_add_u32` clearing checks and the stride clamp, which is refused as `s_max_u32 reads lane mask s6 as numeric data`, each in both stages.
+
+The extract and the clamp emit no HLSL: the clamped stride is a symbol, and a numeric read of it is refused as before (`numeric use of s6 holding descnum`), with or without the earlier mask. It changes output only where it feeds the structured-to-raw conversion of a buffer store, which is recognized in compute and vertex programs. Case I-raw-mask of `tests/startup_gfx2hlsl_compute_check.py` covers that on the GPU: `v_cmp_gt_u32_e64 s21, 3, v0` in a 24-lane group, then the clamped conversion into s21 and the store of case A. The dispatch compares all 320 words with the CPU reference. The translation differs from case I-raw only by the dead compare. Control: `s_max_u32 s21, s21, 1` straight after the compare is still refused. On the translator before this change the case is refused (`s_max_u32 reads lane mask s21 as numeric data`), so the controls and the dispatch fail.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mask_overwrite_controls$' -V
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|warp|hardware)$' -V
 ```
 
 ## Startup translator: lane masks used as vector data
@@ -15448,6 +15520,14 @@ Measured at `741ff02c` plus the dispatch mode, `dev` preset, Windows 11 26300.99
 ```powershell
 ctest --preset dev --no-tests=error -j1 -R '^startup_gfx2hlsl_fma_mix(_fxc|_dispatch_(warp|hardware))?$' -V
 ```
+
+### Signed zero: a `precise` `mad` (cache revision 28)
+
+On an AMD Radeon RX 5700 XT (#2729) and an RX 9070 XT (#2746), the `-0` case read back `00000000` instead of `80000000`; WARP kept the sign. Their probes lost it only when a binary16 operand widened by `f16tof32` fed a non-`precise` multiply or `mad`, and kept it under `precise`. Non-`precise` HLSL arithmetic does not have to keep a zero's sign.
+
+All three forms now call `mix32(a, b, c)`, whose body is `precise float result = mad(a, b, c); return result;`. Operand order, half selection and modifiers are unchanged, and `saturate` stays outside the call. DXC 1.9.2602.17 emits it as `FMad` with `!dx.precise` on the `FMad` and on the `legacyF16ToF32` that feeds it. `mad` still lets a backend fuse or round the product, so the 1 ULP note above still applies. The dispatch mode prints `mad(4097, 4097, -16785408)` per adapter as information: `3f800000` means fused and `00000000` unfused. A second control shader uses a helper that clears the sign of a `-0` result. It must fail only the `-0` case.
+
+Measured on this branch, `dev` preset, Windows 11 26300, DXC 1.9.2602.17, D3D12 debug layer on with 0 errors and 0 warnings. WARP (1414:008c, 10.0.26100.9818): 17 of 17 words, `-0` kept, unfused. NVIDIA GeForce RTX 4090 (10de:2684, 32.0.16.1088): 17 of 17, fused. Both controls behaved as described. The RTX 4090 also passed before this change, so these runs do not show the fix on RDNA. The RX 5700 XT and RX 9070 XT retests are still pending.
 
 ## Non-fused multiply-add in the startup translator
 
@@ -16229,17 +16309,18 @@ a partial-tile BC view does after a later row copy.
 
 An upload of a console-layout texture owns its upload buffer. The buffer and the texture stay referenced
 by the recording and by each submit of it until the queue has completed that submit; the shared
-upload ring, which is reused without waiting for a queue, is not used. `startup_address_console_gate_{warp,hardware}`
+upload ring is not used. `startup_address_console_gate_{warp,hardware}`
 starts by closing and resetting an unsubmitted recording of payload 0, then records the identical bytes again. It makes the queue wait on a fence the fixture holds (queue slot 17), then records and submits eighteen
 lists on one list object, resetting the allocator and the list between them. Each republishes one
 2048 by 2048 RGBA8 texture at `0x109` (16 MiB) from the same address with a new payload and draws it,
 payload 0 over the left half of the target and the others over the right half. No submit may complete
 before the fixture signals the fence. After the last one completes, the left half must hold payload 0
 and the right half payload 17, and the log must report eighteen retained submits released.
-`startup_address_console_gate_ring_{warp,hardware}` is the control: with
-`X2W_TEST_ADDRESS_UPLOAD_RING=1` (fixtures only) the same uploads come from the 256 MiB ring, the
-later ones pass over the bytes of payload 0 before the queue copies them, and the left half must not
-hold payload 0.
+`startup_address_console_gate_ring_{warp,hardware}` uses the shared ring
+instead. It requires a reservation refusal after exhaustion, payload 0
+preserved on the left, the null view on the right, and no retained-upload
+release line. The ring no longer reuses live storage. The revised Windows
+readback control remains unmeasured on macOS.
 
 The equations are checked against addrlib and against the three existing layout headers, not against
 console memory. Which layouts a given console build writes for which textures is not established by
@@ -16439,7 +16520,9 @@ ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 
 The `VEC_F` table of `tools/startup/gfx2hlsl.py` lowers six operations to HLSL with no check that ran them before: `v_rcp_f32` and `v_rcp_iflag_f32` to `1.0 / x`, `v_sqrt_f32` to `sqrt`, `v_rsq_f32` to `rsqrt`, `v_exp_f32` to `exp2` and `v_log_f32` to `log2`. `tests/startup_gfx2hlsl_float_transcendental_check.py` draws them with the shared runner `tests/startup_gfx2hlsl_lane_alu.py`. Each draw applies one operation per lane on flat inputs, alternates the `_e32` and `_e64` spellings, and compares the four result words exactly.
 
-Every input is a power of two, or 0 and 9 for the square root, so every result is exact. The check therefore tests which function each operation is lowered to and the base 2 of `v_exp_f32` and `v_log_f32`. It does not test how many ulps an adapter's approximation may be off.
+Every input is a power of two, or 0 and 9 for the square root, so every result is exactly representable. The check therefore tests which function each operation is lowered to and the base 2 of `v_exp_f32` and `v_log_f32`. It does not test how many ulps an adapter's approximation may be off.
+
+Adapters need not return these results exactly. `v_log_f32` accepts 4 ulps per lane, and the other operations stay exact. The Direct3D 11.3 functional specification (section 22.10.8) bounds `log` to 2^-21 relative error, or 2^-21 absolute error for inputs in [0.5, 2]. In this fixture, either bound is at least 4 ulps of the binary32 result. The DXIL documentation gives no accuracy for `Log`. The renderer still compares exactly. The runner accepts a mismatch only when every lane it reports as `actual=` is within the bound. The mutated draw must read words within the bound of the mutation and outside the bound of the reference. A run whose debug layer reports an error still fails. A ulp bound is effectively exact where the result is 0, as for `log2(1)`: this is much tighter than the absolute 2^-21 the specification allows, and all three adapters return 0 there.
 
 Each operation has a wrong lowering whose first draw must read its own mutated words:
 - `2.0 / x` for the reciprocals;
@@ -16447,7 +16530,7 @@ Each operation has a wrong lowering whose first draw must read its own mutated w
 - the exponent off by one;
 - the logarithm plus one.
 
-On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 24 draws matched through FXC `ps_5_1` and DXC `ps_6_0`, and all 12 mutated draws read their mutated words. `v_sin_f32` and `v_cos_f32` are not covered: their results at the few exact points depend on the approximation. Tests: `startup_gfx2hlsl_float_transcendental_controls`, `startup_gfx2hlsl_float_transcendental_warp` and `startup_gfx2hlsl_float_transcendental_hardware`.
+On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 24 draws matched through FXC `ps_5_1` and DXC `ps_6_0`, and all 12 mutated draws read their mutated words. On an NVIDIA GeForce RTX 4090 (driver 32.0.16.1088, debug layer enabled, 0 errors), the same 24 and 12 pass with the bound, through both compilers (#2797). Three `v_log_f32` lanes are not exact: `0.125` reads `c03fffff` (1 ulp above -3.0), `2^-20` reads `c19fffff` (1 ulp above -20.0) and `0.5` reads `bf7ffffe` (2 ulps above -1.0). With the bound at 0, the first FXC draw fails on `c03fffff`, as reported. With the bound at 1, the FXC mutated draw fails: it reads `bffffffe` for `log2(0.125) + 1`, 2 ulps above -2.0. `v_sin_f32` and `v_cos_f32` are not covered: their results at the few exact points depend on the approximation. Tests: `startup_gfx2hlsl_float_transcendental_controls`, `startup_gfx2hlsl_float_transcendental_warp` and `startup_gfx2hlsl_float_transcendental_hardware`.
 ### gfx1013 pixel DPP16 quad broadcast
 
 The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted in the entry straight-line prefix of a pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. A later uniform loop or forward branch elsewhere in the same stage does not drop that proof (the M200-01/003 shape). Without the proof the instruction is refused, as are a broadcast after a branch target, after EXEC changed, or with divergent EXEC before the broadcast, swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `bound_ctrl:0`, non-VGPR sources and vertex stages. `fi:1` is accepted with the proof and changes nothing, since no source lane is disabled. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
@@ -16631,7 +16714,11 @@ would be folded at compile time and the lowering under test would never run. The
 `0x7fc00000`, `0x40400000`, `0x3fc00000` and `0x3f000000`; the expected words are `0x3f800000`,
 `0x40000000`, `0x3fc00000` and `0x3f800000`. The control that counts restores the branchless helper in the
 same pair and requires a mismatch on the NaN lane alone: `0x40000000` where the ISA asks `0x3f800000`, the
-other three lanes unchanged. A negative control that passes is reported as a failure, not accepted.
+other three lanes unchanged. A negative control that passes is reported as a failure, not accepted. The
+restored helper computes its median as `precise`. Without it, an RX 5700 XT (driver 32.0.21045.29003) folded
+the median against the constant bounds into a clamp and drew the ISA's `0x3f800000` on the NaN lane with FXC
+and DXC, so the defect escaped. With `precise` that adapter and WARP draw `0x40000000` there and match the
+other three lanes. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/2730)
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

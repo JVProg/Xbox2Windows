@@ -310,13 +310,16 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     char index_probe[32]{};
     GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
     void* index_resource = nullptr;
+    void* vertex_resource = nullptr;
     if (index_probe[0]) {
         bool initial_visible = false, final_visible = false;
         const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
-        if (!std::strcmp(index_probe, "visible")) initial_visible = final_visible = true;
-        else if (!std::strcmp(index_probe, "late-visible") || wide_indices) final_visible = true;
-        else if (!std::strcmp(index_probe, "late-clipped")) initial_visible = true;
-        else if (std::strcmp(index_probe, "clipped")) return 70;
+        const bool with_vb = std::strstr(index_probe, "-vb") != nullptr;
+        const bool unplaced_vb = !std::strcmp(index_probe, "late-visible-vb-unplaced");
+        if (!std::strcmp(index_probe, "visible") || !std::strcmp(index_probe, "visible-vb")) initial_visible = final_visible = true;
+        else if (!std::strcmp(index_probe, "late-visible") || !std::strcmp(index_probe, "late-visible-vb") || wide_indices || unplaced_vb) final_visible = true;
+        else if (!std::strcmp(index_probe, "late-clipped") || !std::strcmp(index_probe, "late-clipped-vb")) initial_visible = true;
+        else if (std::strcmp(index_probe, "clipped") && std::strcmp(index_probe, "clipped-vb")) return 70;
         D3D12_FEATURE_DATA_EXISTING_HEAPS capability{};
         if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &capability, sizeof(capability))) || !capability.Supported)
             return 77;
@@ -327,6 +330,26 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(index_memory), arg(&desc),
                 D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&index_resource)))) ||
             !index_resource || invoke(index_resource, 11) != arg(index_memory)) return 72;
+        if (with_vb || unplaced_vb) {
+            void* vertex_memory = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!vertex_memory) return 73;
+            if (!unplaced_vb) {
+                const D3D12_RESOURCE_DESC vdesc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+                    DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+                if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(vertex_memory), arg(&vdesc),
+                        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&vertex_resource)))) ||
+                    !vertex_resource || invoke(vertex_resource, 11) != arg(vertex_memory)) return 74;
+            }
+            auto* vwords = static_cast<float*>(vertex_memory);
+            for (UINT i = 0; i < 6; ++i) {
+                vwords[4 * i + 0] = i >= 3 ? 8.0f : 0.0f;
+                vwords[4 * i + 1] = 0.0f;
+                vwords[4 * i + 2] = 0.0f;
+                vwords[4 * i + 3] = 0.0f;
+            }
+            const D3D12_VERTEX_BUFFER_VIEW vb_view{arg(vertex_memory), 6 * 16, 16};
+            invoke(list, 48, 0, 1, arg(&vb_view));
+        }
         const auto write = [&](bool visible) {
             const UINT first = visible ? 0 : 3;
             if (wide_indices) {
@@ -451,8 +474,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             invoke(list, 25, arg(pso));
             return true;
         };
-        // Retrying the same bytes after abandoning a recording still needs an upload. Keep the
-        // shared-ring control's first upload submitted so its mismatch comes from ring wrap.
+        // Retrying the same bytes after abandoning a recording still needs an upload. The shared-ring
+        // control skips it so every upload behind the gate comes from the ring, whose 256 MiB cap is
+        // then exhausted: the later reservations are refused and those draws bind the null view.
         if (!GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0)) {
             if (const int result = draw_gated_console_payload(guest, list, 0, true)) return result;
             if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || !next_recording()) return 35;
@@ -541,6 +565,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     }
     if (const int rc = submit(last)) return rc;
     if (index_resource) invoke(index_resource, 2); // The backing heap can outlive the resource.
+    if (vertex_resource) invoke(vertex_resource, 2);
     if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
         extern int report_pixel_uavs(const char*);
         if (const int rc = report_pixel_uavs(pixels)) return rc;
